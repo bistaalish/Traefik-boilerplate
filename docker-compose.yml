@@ -1,0 +1,111 @@
+version: '3.3'
+
+services:
+
+  traefik:
+    # Use the latest v3.0.x Traefik image available
+    image: traefik:v3.0
+    ports:
+      # Listen on port 80, default for HTTP, necessary to redirect to HTTPS
+      - 80:80
+      # Listen on port 443, default for HTTPS
+      - 443:443
+    environment:
+      - CLOUDFLARE_EMAIL=${CLOUDFLARE_EMAIL}
+      - CLOUDFLARE_API_KEY=${CLOUDFLARE_API_KEY}
+      - TRAEFIK_AUTH=${TRAEFIK_AUTH}
+    deploy:
+      placement:
+        constraints:
+          # Make the traefik service run only on the node with this label
+          # as the node with it has the volume for the certificates
+          - node.labels.traefik-public.traefik-public-certificates == true
+      labels:
+        # Enable Traefik for this service, to make it available in the public network
+        - traefik.enable=true
+        # Use the traefik-public network (declared below)
+        - traefik.docker.network=traefik-public
+        # Use the custom label "traefik.constraint-label=traefik-public"
+        # This public Traefik will only use services with this label
+        # That way you can add other internal Traefik instances per stack if needed
+        - traefik.constraint-label=traefik-public
+        # admin-auth middleware with HTTP Basic auth
+        # Using the environment variables USERNAME and HASHED_PASSWORD
+        - traefik.http.middlewares.admin-auth.basicauth.users=${TRAEFIK_AUTH}
+        # https-redirect middleware to redirect HTTP to HTTPS
+        # It can be re-used by other stacks in other Docker Compose files
+        - traefik.http.middlewares.https-redirect.redirectscheme.scheme=https
+        - traefik.http.middlewares.https-redirect.redirectscheme.permanent=true
+        # traefik-http set up only to use the middleware to redirect to https
+        # Uses the environment variable DOMAIN
+        - traefik.http.routers.traefik-public-http.rule=Host(`${DOMAIN}`)
+        - traefik.http.routers.traefik-public-http.entrypoints=http
+        - traefik.http.routers.traefik-public-http.middlewares=https-redirect
+        # traefik-https the actual router using HTTPS
+        # Uses the environment variable DOMAIN
+        - traefik.http.routers.traefik-public-https.rule=Host(`${DOMAIN}`)
+        - traefik.http.routers.traefik-public-https.entrypoints=https
+        - traefik.http.routers.traefik-public-https.tls=true
+        # Use the special Traefik service api@internal with the web UI/Dashboard
+        - traefik.http.routers.traefik-public-https.service=api@internal
+        # Use the "le" (Let's Encrypt) resolver created below
+        - traefik.http.routers.traefik-public-https.tls.certresolver=le-staging
+        # Enable HTTP Basic auth, using the middleware created above
+        - traefik.http.routers.traefik-public-https.middlewares=admin-auth
+        # Define the port inside of the Docker service to use
+        - traefik.http.services.traefik-public.loadbalancer.server.port=8080
+        # Add insecureSkipVerify globally for all clients
+#        - traefik.http.services.traefik-public.loadbalancer.serversTransport.insecureSkipVerify=true
+    volumes:
+      # Add Docker as a mounted volume, so that Traefik can read the labels of other services
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Mount the volume to store the certificates
+      - /nfs/traefik_share:/etc/traefik/
+    command:
+      # Enable Docker in Traefik, so that it reads labels from Docker services
+      - --providers.docker
+      # Add a constraint to only use services with the label "traefik.constraint-label=traefik-public"
+      - --providers.docker.constraints=Label(`traefik.constraint-label`, `traefik-public`)
+      # Do not expose all Docker services, only the ones explicitly exposed
+      - --providers.docker.exposedbydefault=false
+      # Enable Docker Swarm mode
+      - --providers.swarm.endpoint=unix:///var/run/docker.sock
+      # Enable file provier
+      - --providers.file
+      - --providers.file.directory=/etc/traefik/files
+      - --providers.file.watch=true
+      # Create an entrypoint "http" listening on port 80
+      - --entrypoints.http.address=:80
+      # Create an entrypoint "https" listening on port 443
+      - --entrypoints.https.address=:443
+      # Create the certificate resolver "le" for Let's Encrypt, uses the environment variable EMAIL
+      - --certificatesresolvers.le.acme.email=${CLOUDFLARE_EMAIL}
+      # Store the Let's Encrypt certificates in the mounted volume
+      - --certificatesresolvers.le.acme.storage=/etc/traefik/letsencrypt/acme.json
+      - --certificatesresolvers.le.acme.dnschallenge.provider=cloudflare  # Use Cloudflare as DNS provider for ACME challenge
+      - --certificatesresolvers.le.acme.dnschallenge.resolvers=1.1.1.1:53,8.8.8.8:53  # Custom DNS resolvers for DNS challenge
+      # Use the TLS Challenge for Let's Encrypt
+      - --certificatesresolvers.le.acme.tlschallenge=true
+      - --certificatesresolvers.le-staging.acme.email=${CLOUDFLARE_EMAIL}
+      - --certificatesresolvers.le-staging.acme.dnschallenge.provider=cloudflare  # Use Cloudflare as DNS provider for ACME challenge
+      - --certificatesresolvers.le-staging.acme.dnschallenge.resolvers=1.1.1.1:53,8.8.8.8:53  # Custom DNS resolvers for DNS challenge
+      - --certificatesresolvers.le-staging.acme.storage=/etc/traefik/letsencrypt/staging-acme.json
+      - --certificatesresolvers.le-staging.acme.tlschallenge=true
+      - --certificatesresolvers.le-staging.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory
+      # Enable the access log, with HTTP requests
+      - --accesslog
+      # Enable the Traefik log, for configurations and errors
+      - --log
+      # Enable the Dashboard and API
+      - --api
+    networks:
+      # Use the public network created to be shared between Traefik and
+      # any other service that needs to be publicly available with HTTPS
+      - traefik-public
+
+networks:
+  # Use the previously created public network "traefik-public", shared with other
+  # services that need to be publicly available via this Traefik
+  traefik-public:
+    external: true
+
